@@ -5,6 +5,8 @@
 #include "riscv.h"
 #include "defs.h"
 #include "fs.h"
+#include "spinlock.h"
+#include "proc.h"
 
 /*
  * the kernel's page table.
@@ -14,6 +16,9 @@ pagetable_t kernel_pagetable;
 extern char etext[];  // kernel.ld sets this to end of kernel code.
 
 extern char trampoline[]; // trampoline.S
+//
+//void uvmlazytouch(uint64 va);
+//int uvmshouldtouch(uint64 va);
 
 /*
  * create a direct-map page table for the kernel.
@@ -181,9 +186,11 @@ uvmunmap(pagetable_t pagetable, uint64 va, uint64 npages, int do_free)
 
   for(a = va; a < va + npages*PGSIZE; a += PGSIZE){
     if((pte = walk(pagetable, a, 0)) == 0)
-      panic("uvmunmap: walk");
+      // panic("uvmunmap: walk");
+      continue; // 如果页表项不存在，跳过当前地址 （原本是直接panic）
     if((*pte & PTE_V) == 0)
-      panic("uvmunmap: not mapped");
+      // panic("uvmunmap: not mapped");
+      continue; // 如果页表项不存在，跳过当前地址 （原本是直接panic）
     if(PTE_FLAGS(*pte) == PTE_V)
       panic("uvmunmap: not a leaf");
     if(do_free){
@@ -315,9 +322,11 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
 
   for(i = 0; i < sz; i += PGSIZE){
     if((pte = walk(old, i, 0)) == 0)
-      panic("uvmcopy: pte should exist");
+      // panic("uvmcopy: pte should exist");
+      continue; // 如果一个页不存在，则认为是懒加载的页，忽略即可
     if((*pte & PTE_V) == 0)
-      panic("uvmcopy: page not present");
+      // panic("uvmcopy: page not present");
+      continue; // 如果一个页不存在，则认为是懒加载的页，忽略即可
     pa = PTE2PA(*pte);
     flags = PTE_FLAGS(*pte);
     if((mem = kalloc()) == 0)
@@ -356,6 +365,9 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
 {
   uint64 n, va0, pa0;
 
+  if(uvmshouldtouch(dstva))
+    uvmlazytouch(dstva);
+
   while(len > 0){
     va0 = PGROUNDDOWN(dstva);
     pa0 = walkaddr(pagetable, va0);
@@ -380,6 +392,9 @@ int
 copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len)
 {
   uint64 n, va0, pa0;
+
+  if(uvmshouldtouch(srcva))
+    uvmlazytouch(srcva);
 
   while(len > 0){
     va0 = PGROUNDDOWN(srcva);
@@ -439,4 +454,43 @@ copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
   } else {
     return -1;
   }
+}
+
+
+// uvmlazytouch 函数负责分配实际的物理内存并建立映射。懒分配的内存页在被 touch 后就可以被使用了。
+// uvmshouldtouch 用于检测一个虚拟地址是不是一个需要被 touch 的懒分配内存地址，具体检测的是：
+
+// 处于 [0, p->sz)地址范围之中（进程申请的内存范围）
+// 不是栈的 guard page（具体见 xv6 book，栈页的低一页故意留成不映射，作为哨兵用于捕捉 stack overflow 错误。
+// 懒分配不应该给这个地址分配物理页和建立映射，而应该直接抛出异常）
+// （解决 usertests 中的 stacktest 失败的问题）
+// 页表项不存在
+
+// touch a lazy-allocated page so it's mapped to an actual physical page.
+void uvmlazytouch(uint64 va) {
+  struct proc *p = myproc();
+  char *mem = kalloc();
+  if(mem == 0) {
+    // failed to allocate physical memory
+    printf("lazy alloc: out of memory\n");
+    p->killed = 1;
+  } else {
+    memset(mem, 0, PGSIZE);
+    if(mappages(p->pagetable, PGROUNDDOWN(va), PGSIZE, (uint64)mem, PTE_W|PTE_X|PTE_R|PTE_U) != 0){
+      printf("lazy alloc: failed to map page\n");
+      kfree(mem);
+      p->killed = 1;
+    }
+  }
+  // printf("lazy alloc: %p, p->sz: %p\n", PGROUNDDOWN(va), p->sz);
+}
+
+// whether a page is previously lazy-allocated and needed to be touched before use.
+int uvmshouldtouch(uint64 va) {
+  pte_t *pte;
+  struct proc *p = myproc();
+  
+  return va < p->sz // within size of memory for the process
+    && PGROUNDDOWN(va) != r_sp() // not accessing stack guard page (it shouldn't be mapped)
+    && (((pte = walk(p->pagetable, va, 0))==0) || ((*pte & PTE_V)==0)); // page table entry does not exist
 }
